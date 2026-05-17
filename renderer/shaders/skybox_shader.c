@@ -54,6 +54,7 @@ static void draw_model(model_t *model, framebuffer_t *framebuffer,
         skybox_attribs_t *attribs;
         int i, j;
 
+        graphics_begin_batch(framebuffer, program);
         for (i = 0; i < num_faces; i++) {
             for (j = 0; j < 3; j++) {
                 vertex_t vertex = vertices[i * 3 + j];
@@ -62,6 +63,7 @@ static void draw_model(model_t *model, framebuffer_t *framebuffer,
             }
             graphics_draw_triangle(framebuffer, program);
         }
+        graphics_end_batch();
     }
 }
 

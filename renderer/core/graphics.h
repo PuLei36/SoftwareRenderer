@@ -28,8 +28,11 @@ program_t *program_create(
 void program_release(program_t *program);
 void *program_get_attribs(program_t *program, int nth_vertex);
 void *program_get_uniforms(program_t *program);
+void program_set_batch_min_pixels(program_t *program, int min_pixels);
 
 /* graphics pipeline */
+void graphics_begin_batch(framebuffer_t *framebuffer, program_t *program);
+void graphics_end_batch(void);
 void graphics_draw_triangle(framebuffer_t *framebuffer, program_t *program);
 
 #endif

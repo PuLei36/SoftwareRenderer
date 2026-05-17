@@ -7,7 +7,7 @@
 /* low-level api */
 
 static mat4_t get_model_matrix(blinn_attribs_t *attribs,
-                               blinn_uniforms_t *uniforms) {
+                               blinn_uniforms_t *uniforms) {    /* skinning */
     if (uniforms->joint_matrices) {
         mat4_t joint_matrices[4];
         mat4_t skin_matrix;
@@ -25,7 +25,7 @@ static mat4_t get_model_matrix(blinn_attribs_t *attribs,
 }
 
 static mat3_t get_normal_matrix(blinn_attribs_t *attribs,
-                                blinn_uniforms_t *uniforms) {
+                                blinn_uniforms_t *uniforms) {   /* normal skinning */
     if (uniforms->joint_n_matrices) {
         mat3_t joint_n_matrices[4];
         mat3_t skin_n_matrix;
@@ -42,7 +42,7 @@ static mat3_t get_normal_matrix(blinn_attribs_t *attribs,
     }
 }
 
-static vec4_t shadow_vertex_shader(blinn_attribs_t *attribs,
+static vec4_t shadow_vertex_shader(blinn_attribs_t *attribs,    /* shadow vertex shader */
                                    blinn_varyings_t *varyings,
                                    blinn_uniforms_t *uniforms) {
     mat4_t model_matrix = get_model_matrix(attribs, uniforms);
@@ -56,7 +56,7 @@ static vec4_t shadow_vertex_shader(blinn_attribs_t *attribs,
     return depth_position;
 }
 
-static vec4_t common_vertex_shader(blinn_attribs_t *attribs,
+static vec4_t common_vertex_shader(blinn_attribs_t *attribs,    /* main vertex shader */
                                    blinn_varyings_t *varyings,
                                    blinn_uniforms_t *uniforms) {
     mat4_t model_matrix = get_model_matrix(attribs, uniforms);
@@ -79,7 +79,7 @@ static vec4_t common_vertex_shader(blinn_attribs_t *attribs,
     return clip_position;
 }
 
-vec4_t blinn_vertex_shader(void *attribs_, void *varyings_, void *uniforms_) {
+vec4_t blinn_vertex_shader(void *attribs_, void *varyings_, void *uniforms_) {      /* select vertex shader */
     blinn_attribs_t *attribs = (blinn_attribs_t*)attribs_;
     blinn_varyings_t *varyings = (blinn_varyings_t*)varyings_;
     blinn_uniforms_t *uniforms = (blinn_uniforms_t*)uniforms_;
@@ -91,7 +91,7 @@ vec4_t blinn_vertex_shader(void *attribs_, void *varyings_, void *uniforms_) {
     }
 }
 
-static vec4_t shadow_fragment_shader(blinn_varyings_t *varyings,
+static vec4_t shadow_fragment_shader(blinn_varyings_t *varyings,    /* shadow pass */
                                      blinn_uniforms_t *uniforms,
                                      int *discard) {
     if (uniforms->alpha_cutoff > 0) {
@@ -116,7 +116,7 @@ typedef struct {
     vec3_t emission;
 } material_t;
 
-static material_t get_material(blinn_varyings_t *varyings,
+static material_t get_material(blinn_varyings_t *varyings,      /* sample material */
                                blinn_uniforms_t *uniforms,
                                int backface) {
     vec2_t texcoord = varyings->texcoord;
@@ -159,14 +159,14 @@ static material_t get_material(blinn_varyings_t *varyings,
     return material;
 }
 
-static vec3_t get_view_dir(blinn_varyings_t *varyings,
+static vec3_t get_view_dir(blinn_varyings_t *varyings,     /* view direction */
                            blinn_uniforms_t *uniforms) {
     vec3_t camera_pos = uniforms->camera_pos;
     vec3_t world_pos = varyings->world_position;
     return vec3_normalize(vec3_sub(camera_pos, world_pos));
 }
 
-static int is_in_shadow(blinn_varyings_t *varyings,
+static int is_in_shadow(blinn_varyings_t *varyings,    /* shadow test */
                         blinn_uniforms_t *uniforms,
                         float n_dot_l) {
     if (uniforms->shadow_map) {
@@ -189,7 +189,7 @@ static int is_zero_vector(vec3_t v) {
     return v.x == 0 && v.y == 0 && v.z == 0;
 }
 
-static vec3_t get_specular(vec3_t light_dir, vec3_t view_dir,
+static vec3_t get_specular(vec3_t light_dir, vec3_t view_dir,   /* specular term */
                            material_t material) {
     if (!is_zero_vector(material.specular)) {
         vec3_t half_dir = vec3_normalize(vec3_add(light_dir, view_dir));
@@ -202,7 +202,7 @@ static vec3_t get_specular(vec3_t light_dir, vec3_t view_dir,
     return vec3_new(0, 0, 0);
 }
 
-static vec4_t common_fragment_shader(blinn_varyings_t *varyings,
+static vec4_t common_fragment_shader(blinn_varyings_t *varyings,    /* final shading */
                                      blinn_uniforms_t *uniforms,
                                      int *discard,
                                      int backface) {
@@ -304,6 +304,14 @@ static void draw_model(model_t *model, framebuffer_t *framebuffer,
 
     uniforms = (blinn_uniforms_t*)program_get_uniforms(model->program);
     uniforms->shadow_pass = shadow_pass;
+    if (shadow_pass) {
+        program_set_batch_min_pixels(program, 0);
+    } else {
+        program_set_batch_min_pixels(program, 256);
+    }
+    if (!shadow_pass) {
+        graphics_begin_batch(framebuffer, program);
+    }
     for (i = 0; i < num_faces; i++) {
         for (j = 0; j < 3; j++) {
             vertex_t vertex = vertices[i * 3 + j];
@@ -315,6 +323,9 @@ static void draw_model(model_t *model, framebuffer_t *framebuffer,
             attribs->weight = vertex.weight;
         }
         graphics_draw_triangle(framebuffer, program);
+    }
+    if (!shadow_pass) {
+        graphics_end_batch();
     }
 }
 

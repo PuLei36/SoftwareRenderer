@@ -5,6 +5,65 @@
 #include "graphics.h"
 #include "macro.h"
 #include "maths.h"
+#include "darray.h"
+#include "threadpool.h"
+
+#define RASTER_TILE_SIZE 16
+#define RASTER_TILE_MIN_PIXELS 256
+
+typedef struct {void *buffer; int size;} worker_varyings_t;
+
+typedef struct {
+    int backface;
+    vec2_t screen_coords[3];
+    float screen_depths[3];
+    float recip_w[3];
+    unsigned char *varyings;
+} tri_job_t;
+
+typedef struct {
+    tri_job_t **jobs;
+} tile_bin_t;
+
+typedef struct {
+    int active;
+    framebuffer_t *framebuffer;
+    program_t *program;
+    int tile_cols;
+    int tile_rows;
+    tile_bin_t *tiles;
+    tri_job_t **jobs_all;
+} batch_t;
+
+typedef struct {
+    framebuffer_t *framebuffer;
+    program_t *program;
+    int min_x, min_y, max_x, max_y;
+    tri_job_t **jobs;
+    int job_count;
+} tile_task_t;
+
+static threadpool_t *g_threadpool = NULL;
+static int g_threadpool_threads = 0;
+static int g_threadpool_initialized = 0;
+static worker_varyings_t *g_worker_varyings = NULL;
+static int g_worker_varyings_count = 0;
+static batch_t g_batch = {0, NULL, NULL, 0, 0, NULL, NULL};
+
+static void graphics_shutdown(void);
+static void ensure_threadpool(void);
+static void *get_worker_varyings(int worker_index, int size);
+static void batch_clear(void);
+static int min_integer(int a, int b);
+static void tri_job_free(tri_job_t *job);
+static vec3_t calculate_weights(vec2_t abc[3], vec2_t p);
+static float interpolate_depth(float screen_depths[3], vec3_t weights);
+static void interpolate_varyings(
+    void *src_varyings[3], void *dst_varyings,
+    int sizeof_varyings, vec3_t weights, float recip_w[3]);
+static void draw_fragment(framebuffer_t *framebuffer, program_t *program,
+              int backface, int index, float depth,
+              void *shader_varyings);
 
 /* framebuffer management */
 
@@ -66,6 +125,7 @@ struct program {
     int sizeof_uniforms;
     int double_sided;
     int enable_blend;
+    int batch_min_pixels;
     /* for shaders */
     void *shader_attribs[3];
     void *shader_varyings;
@@ -96,6 +156,7 @@ program_t *program_create(
     program->sizeof_uniforms = sizeof_uniforms;
     program->double_sided = double_sided;
     program->enable_blend = enable_blend;
+    program->batch_min_pixels = RASTER_TILE_MIN_PIXELS;
 
     for (i = 0; i < 3; i++) {
         program->shader_attribs[i] = malloc(sizeof_attribs);
@@ -136,6 +197,335 @@ void *program_get_attribs(program_t *program, int nth_vertex) {
 
 void *program_get_uniforms(program_t *program) {
     return program->shader_uniforms;
+}
+
+void program_set_batch_min_pixels(program_t *program, int min_pixels) {
+    if (program) {
+        program->batch_min_pixels = min_pixels;
+    }
+}
+
+static void graphics_shutdown(void) {
+    int i;
+    if (g_batch.active) {
+        batch_clear();
+    }
+    if (g_worker_varyings) {
+        for (i = 0; i < g_worker_varyings_count; i++) {
+            free(g_worker_varyings[i].buffer);
+        }
+        free(g_worker_varyings);
+        g_worker_varyings = NULL;
+        g_worker_varyings_count = 0;
+    }
+    if (g_threadpool) {
+        threadpool_release(g_threadpool);
+        g_threadpool = NULL;
+        g_threadpool_threads = 0;
+    }
+}
+
+static void ensure_threadpool(void) {
+    int num_threads;
+    int i;
+
+    if (g_threadpool_initialized) {
+        return;
+    }
+    g_threadpool_initialized = 1;
+
+    num_threads = threadpool_default_threads();
+    if (num_threads <= 1) {
+        return;
+    }
+
+    g_threadpool = threadpool_create(num_threads);
+    if (!g_threadpool) {
+        return;
+    }
+
+    g_threadpool_threads = threadpool_num_threads(g_threadpool);
+    g_worker_varyings_count = g_threadpool_threads;
+    g_worker_varyings = (worker_varyings_t*)malloc(
+        sizeof(worker_varyings_t) * g_worker_varyings_count);
+    for (i = 0; i < g_worker_varyings_count; i++) {
+        g_worker_varyings[i].buffer = NULL;
+        g_worker_varyings[i].size = 0;
+    }
+
+    atexit(graphics_shutdown);
+}
+
+static void *get_worker_varyings(int worker_index, int size) {
+    worker_varyings_t *slot;
+    if (worker_index < 0 || worker_index >= g_worker_varyings_count) {
+        return NULL;
+    }
+    slot = &g_worker_varyings[worker_index];
+    if (slot->size < size) {
+        free(slot->buffer);
+        slot->buffer = malloc(size);
+        slot->size = size;
+    }
+    return slot->buffer;
+}
+
+static void batch_clear(void) {
+    int i;
+    int tile_count;
+
+    if (!g_batch.tiles) {
+        g_batch.active = 0;
+        g_batch.framebuffer = NULL;
+        g_batch.program = NULL;
+        g_batch.tile_cols = 0;
+        g_batch.tile_rows = 0;
+        return;
+    }
+
+    tile_count = g_batch.tile_cols * g_batch.tile_rows;
+    for (i = 0; i < tile_count; i++) {
+        if (g_batch.tiles[i].jobs) {
+            darray_free(g_batch.tiles[i].jobs);
+            g_batch.tiles[i].jobs = NULL;
+        }
+    }
+    free(g_batch.tiles);
+    g_batch.tiles = NULL;
+    if (g_batch.jobs_all) {
+        int job_count = darray_size(g_batch.jobs_all);
+        for (i = 0; i < job_count; i++) {
+            tri_job_free(g_batch.jobs_all[i]);
+        }
+        darray_free(g_batch.jobs_all);
+        g_batch.jobs_all = NULL;
+    }
+    g_batch.active = 0;
+    g_batch.framebuffer = NULL;
+    g_batch.program = NULL;
+    g_batch.tile_cols = 0;
+    g_batch.tile_rows = 0;
+}
+
+static tri_job_t *tri_job_create(program_t *program, int backface,
+                                 vec2_t screen_coords[3],
+                                 float screen_depths[3],
+                                 float recip_w[3],
+                                 void *varyings[3]) {
+    tri_job_t *job = (tri_job_t*)malloc(sizeof(tri_job_t));
+    int sizeof_varyings = program->sizeof_varyings;
+    unsigned char *buffer;
+    int i;
+
+    job->backface = backface;
+    for (i = 0; i < 3; i++) {
+        job->screen_coords[i] = screen_coords[i];
+        job->screen_depths[i] = screen_depths[i];
+        job->recip_w[i] = recip_w[i];
+    }
+
+    buffer = (unsigned char*)malloc(sizeof_varyings * 3);
+    for (i = 0; i < 3; i++) {
+        memcpy(buffer + i * sizeof_varyings, varyings[i], sizeof_varyings);
+    }
+    job->varyings = buffer;
+
+    return job;
+}
+
+static void tri_job_free(tri_job_t *job) {
+    if (job) {
+        free(job->varyings);
+        free(job);
+    }
+}
+
+static void rasterize_job_tile(framebuffer_t *framebuffer, program_t *program,
+                               tri_job_t *job,
+                               int min_x, int min_y,
+                               int max_x, int max_y,
+                               void *local_varyings) {
+    vec2_t *screen_coords = job->screen_coords;
+    float *screen_depths = job->screen_depths;
+    float *recip_w = job->recip_w;
+    void *varyings[3];
+    int sizeof_varyings = program->sizeof_varyings;
+    int width = framebuffer->width;
+    int x, y;
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        varyings[i] = job->varyings + i * sizeof_varyings;
+    }
+
+    for (x = min_x; x <= max_x; x++) {
+        for (y = min_y; y <= max_y; y++) {
+            vec2_t point = vec2_new((float)x + 0.5f, (float)y + 0.5f);
+            vec3_t weights = calculate_weights(screen_coords, point);
+            int weight0_okay = weights.x > -EPSILON;
+            int weight1_okay = weights.y > -EPSILON;
+            int weight2_okay = weights.z > -EPSILON;
+            if (weight0_okay && weight1_okay && weight2_okay) {
+                int index = y * width + x;
+                float depth = interpolate_depth(screen_depths, weights);
+                if (depth <= framebuffer->depth_buffer[index]) {
+                    interpolate_varyings(varyings, local_varyings,
+                                         program->sizeof_varyings,
+                                         weights, recip_w);
+                    draw_fragment(framebuffer, program, job->backface,
+                                  index, depth, local_varyings);
+                }
+            }
+        }
+    }
+}
+
+static void batch_process_tile(tile_task_t *task, int worker_index) {
+    program_t *program = task->program;
+    void *local_varyings = NULL;
+    int local_alloc = 0;
+    int i;
+
+    if (worker_index >= 0) {
+        local_varyings = get_worker_varyings(worker_index,
+                                             program->sizeof_varyings);
+        if (local_varyings == NULL) {
+            local_varyings = malloc(program->sizeof_varyings);
+            local_alloc = 1;
+        }
+    } else {
+        local_varyings = program->shader_varyings;
+    }
+
+    for (i = 0; i < task->job_count; i++) {
+        tri_job_t *job = task->jobs[i];
+        rasterize_job_tile(task->framebuffer, program, job,
+                           task->min_x, task->min_y,
+                           task->max_x, task->max_y,
+                           local_varyings);
+    }
+    darray_free(task->jobs);
+
+    if (local_alloc) {
+        free(local_varyings);
+    }
+}
+
+static void batch_tile_task(void *task_data, int worker_index) {
+    tile_task_t *task = (tile_task_t*)task_data;
+    batch_process_tile(task, worker_index);
+    free(task);
+}
+
+void graphics_begin_batch(framebuffer_t *framebuffer, program_t *program) {
+    int tile_count;
+
+    if (g_batch.active) {
+        graphics_end_batch();
+    }
+
+    if (program == NULL || program->batch_min_pixels <= 0) {
+        g_batch.active = 0;
+        g_batch.framebuffer = NULL;
+        g_batch.program = NULL;
+        return;
+    }
+
+    ensure_threadpool();
+    if (!(g_threadpool && g_threadpool_threads > 1)) {
+        g_batch.active = 0;
+        g_batch.framebuffer = NULL;
+        g_batch.program = NULL;
+        return;
+    }
+
+    g_batch.active = 1;
+    g_batch.framebuffer = framebuffer;
+    g_batch.program = program;
+    g_batch.tile_cols = (framebuffer->width + RASTER_TILE_SIZE - 1) /
+                        RASTER_TILE_SIZE;
+    g_batch.tile_rows = (framebuffer->height + RASTER_TILE_SIZE - 1) /
+                        RASTER_TILE_SIZE;
+    g_batch.jobs_all = NULL;
+    tile_count = g_batch.tile_cols * g_batch.tile_rows;
+    g_batch.tiles = (tile_bin_t*)malloc(sizeof(tile_bin_t) * tile_count);
+    memset(g_batch.tiles, 0, sizeof(tile_bin_t) * tile_count);
+}
+
+void graphics_end_batch(void) {
+    int tile_count;
+    int tile_index;
+    int tile_x, tile_y;
+    int min_x, min_y, max_x, max_y;
+    int job_count;
+    tile_task_t *task;
+
+    if (!g_batch.active) {
+        return;
+    }
+
+    tile_count = g_batch.tile_cols * g_batch.tile_rows;
+    ensure_threadpool();
+
+    if (g_threadpool && g_threadpool_threads > 1) {
+        for (tile_index = 0; tile_index < tile_count; tile_index++) {
+            job_count = darray_size(g_batch.tiles[tile_index].jobs);
+            if (job_count == 0) {
+                continue;
+            }
+            tile_x = tile_index % g_batch.tile_cols;
+            tile_y = tile_index / g_batch.tile_cols;
+            min_x = tile_x * RASTER_TILE_SIZE;
+            min_y = tile_y * RASTER_TILE_SIZE;
+            max_x = min_integer(min_x + RASTER_TILE_SIZE - 1,
+                                g_batch.framebuffer->width - 1);
+            max_y = min_integer(min_y + RASTER_TILE_SIZE - 1,
+                                g_batch.framebuffer->height - 1);
+
+            task = (tile_task_t*)malloc(sizeof(tile_task_t));
+            task->framebuffer = g_batch.framebuffer;
+            task->program = g_batch.program;
+            task->min_x = min_x;
+            task->min_y = min_y;
+            task->max_x = max_x;
+            task->max_y = max_y;
+            task->jobs = g_batch.tiles[tile_index].jobs;
+            task->job_count = job_count;
+            g_batch.tiles[tile_index].jobs = NULL;
+            threadpool_submit(g_threadpool, batch_tile_task, task);
+        }
+        threadpool_wait(g_threadpool);
+    } else {
+        for (tile_index = 0; tile_index < tile_count; tile_index++) {
+            job_count = darray_size(g_batch.tiles[tile_index].jobs);
+            if (job_count == 0) {
+                continue;
+            }
+            tile_x = tile_index % g_batch.tile_cols;
+            tile_y = tile_index / g_batch.tile_cols;
+            min_x = tile_x * RASTER_TILE_SIZE;
+            min_y = tile_y * RASTER_TILE_SIZE;
+            max_x = min_integer(min_x + RASTER_TILE_SIZE - 1,
+                                g_batch.framebuffer->width - 1);
+            max_y = min_integer(min_y + RASTER_TILE_SIZE - 1,
+                                g_batch.framebuffer->height - 1);
+
+            task = (tile_task_t*)malloc(sizeof(tile_task_t));
+            task->framebuffer = g_batch.framebuffer;
+            task->program = g_batch.program;
+            task->min_x = min_x;
+            task->min_y = min_y;
+            task->max_x = max_x;
+            task->max_y = max_y;
+            task->jobs = g_batch.tiles[tile_index].jobs;
+            task->job_count = job_count;
+            g_batch.tiles[tile_index].jobs = NULL;
+            batch_process_tile(task, -1);
+            free(task);
+        }
+    }
+
+    batch_clear();
 }
 
 /* graphics pipeline */
@@ -425,14 +815,36 @@ static void interpolate_varyings(
     }
 }
 
+typedef struct {
+    framebuffer_t *framebuffer;
+    program_t *program;
+    int backface;
+    vec2_t screen_coords[3];
+    float screen_depths[3];
+    float recip_w[3];
+    void *varyings[3];
+} raster_shared_t;
+
+typedef struct {
+    raster_shared_t *shared;
+    int min_x, min_y, max_x, max_y;
+} raster_task_t;
+
+static void rasterize_tile_range(raster_shared_t *shared,
+                                 int min_x, int min_y,
+                                 int max_x, int max_y,
+                                 void *local_varyings);
+static void rasterize_tile_task(void *task_data, int worker_index);
+
 static void draw_fragment(framebuffer_t *framebuffer, program_t *program,
-                          int backface, int index, float depth) {
+                          int backface, int index, float depth,
+                          void *shader_varyings) {
     vec4_t color;
     int discard;
 
     /* execute fragment shader */
     discard = 0;
-    color = program->fragment_shader(program->shader_varyings,
+    color = program->fragment_shader(shader_varyings,
                                      program->shader_uniforms,
                                      &discard,
                                      backface);
@@ -459,6 +871,63 @@ static void draw_fragment(framebuffer_t *framebuffer, program_t *program,
     framebuffer->depth_buffer[index] = depth;
 }
 
+static void rasterize_tile_range(raster_shared_t *shared,
+                                 int min_x, int min_y,
+                                 int max_x, int max_y,
+                                 void *local_varyings) {
+    framebuffer_t *framebuffer = shared->framebuffer;
+    program_t *program = shared->program;
+    vec2_t *screen_coords = shared->screen_coords;
+    float *screen_depths = shared->screen_depths;
+    float *recip_w = shared->recip_w;
+    void **varyings = shared->varyings;
+    int width = framebuffer->width;
+    int x, y;
+
+    for (x = min_x; x <= max_x; x++) {
+        for (y = min_y; y <= max_y; y++) {
+            vec2_t point = vec2_new((float)x + 0.5f, (float)y + 0.5f);
+            vec3_t weights = calculate_weights(screen_coords, point);
+            int weight0_okay = weights.x > -EPSILON;
+            int weight1_okay = weights.y > -EPSILON;
+            int weight2_okay = weights.z > -EPSILON;
+            if (weight0_okay && weight1_okay && weight2_okay) {
+                int index = y * width + x;
+                float depth = interpolate_depth(screen_depths, weights);
+                if (depth <= framebuffer->depth_buffer[index]) {
+                    interpolate_varyings(varyings, local_varyings,
+                                         program->sizeof_varyings,
+                                         weights, recip_w);
+                    draw_fragment(framebuffer, program, shared->backface,
+                                  index, depth, local_varyings);
+                }
+            }
+        }
+    }
+}
+
+static void rasterize_tile_task(void *task_data, int worker_index) {
+    raster_task_t *task = (raster_task_t*)task_data;
+    raster_shared_t *shared = task->shared;
+    void *local_varyings;
+    int local_alloc = 0;
+
+    local_varyings = get_worker_varyings(worker_index,
+                                         shared->program->sizeof_varyings);
+    if (local_varyings == NULL) {
+        local_varyings = malloc(shared->program->sizeof_varyings);
+        local_alloc = 1;
+    }
+
+    rasterize_tile_range(shared, task->min_x, task->min_y,
+                         task->max_x, task->max_y, local_varyings);
+
+    if (local_alloc) {
+        free(local_varyings);
+    }
+    free(task);
+}
+
 static int rasterize_triangle(framebuffer_t *framebuffer, program_t *program,
                               vec4_t clip_coords[3], void *varyings[3]) {
     int width = framebuffer->width;
@@ -469,7 +938,14 @@ static int rasterize_triangle(framebuffer_t *framebuffer, program_t *program,
     float recip_w[3];
     int backface;
     bbox_t bbox;
-    int i, x, y;
+    int bbox_width;
+    int bbox_height;
+    int pixel_count;
+    int use_multithread;
+    int tile_x, tile_y;
+    raster_shared_t shared;
+    raster_task_t *task;
+    int i;
 
     /* perspective division */
     for (i = 0; i < 3; i++) {
@@ -497,24 +973,119 @@ static int rasterize_triangle(framebuffer_t *framebuffer, program_t *program,
 
     /* perform rasterization */
     bbox = find_bounding_box(screen_coords, width, height);
-    for (x = bbox.min_x; x <= bbox.max_x; x++) {
-        for (y = bbox.min_y; y <= bbox.max_y; y++) {
-            vec2_t point = vec2_new((float)x + 0.5f, (float)y + 0.5f);
-            vec3_t weights = calculate_weights(screen_coords, point);
-            int weight0_okay = weights.x > -EPSILON;
-            int weight1_okay = weights.y > -EPSILON;
-            int weight2_okay = weights.z > -EPSILON;
-            if (weight0_okay && weight1_okay && weight2_okay) {
-                int index = y * width + x;
-                float depth = interpolate_depth(screen_depths, weights);
-                /* early depth testing */
-                if (depth <= framebuffer->depth_buffer[index]) {
-                    interpolate_varyings(varyings, program->shader_varyings,
-                                         program->sizeof_varyings,
-                                         weights, recip_w);
-                    draw_fragment(framebuffer, program, backface, index, depth);
-                }
-            }
+
+    shared.framebuffer = framebuffer;
+    shared.program = program;
+    shared.backface = backface;
+    for (i = 0; i < 3; i++) {
+        shared.screen_coords[i] = screen_coords[i];
+        shared.screen_depths[i] = screen_depths[i];
+        shared.recip_w[i] = recip_w[i];
+        shared.varyings[i] = varyings[i];
+    }
+
+    ensure_threadpool();
+    bbox_width = bbox.max_x - bbox.min_x + 1;
+    bbox_height = bbox.max_y - bbox.min_y + 1;
+    pixel_count = bbox_width * bbox_height;
+    use_multithread = g_threadpool && g_threadpool_threads > 1 &&
+                      pixel_count >= RASTER_TILE_MIN_PIXELS;
+
+    if (!use_multithread) {
+        rasterize_tile_range(&shared, bbox.min_x, bbox.min_y,
+                             bbox.max_x, bbox.max_y,
+                             program->shader_varyings);
+        return 0;
+    }
+
+    for (tile_y = bbox.min_y; tile_y <= bbox.max_y; tile_y += RASTER_TILE_SIZE) {
+        for (tile_x = bbox.min_x; tile_x <= bbox.max_x; tile_x += RASTER_TILE_SIZE) {
+            task = (raster_task_t*)malloc(sizeof(raster_task_t));
+            task->shared = &shared;
+            task->min_x = tile_x;
+            task->min_y = tile_y;
+            task->max_x = min_integer(tile_x + RASTER_TILE_SIZE - 1, bbox.max_x);
+            task->max_y = min_integer(tile_y + RASTER_TILE_SIZE - 1, bbox.max_y);
+            threadpool_submit(g_threadpool, rasterize_tile_task, task);
+        }
+    }
+    threadpool_wait(g_threadpool);
+
+    return 0;
+}
+
+static int bin_triangle(framebuffer_t *framebuffer, program_t *program,
+                        vec4_t clip_coords[3], void *varyings[3]) {
+    int width = framebuffer->width;
+    int height = framebuffer->height;
+    vec3_t ndc_coords[3];
+    vec2_t screen_coords[3];
+    float screen_depths[3];
+    float recip_w[3];
+    int backface;
+    bbox_t bbox;
+    int bbox_width;
+    int bbox_height;
+    int pixel_count;
+    int tile_x0, tile_x1, tile_y0, tile_y1;
+    int tile_x, tile_y;
+    int tile_index;
+    tri_job_t *job;
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        vec3_t clip_coord = vec3_from_vec4(clip_coords[i]);
+        ndc_coords[i] = vec3_div(clip_coord, clip_coords[i].w);
+    }
+
+    backface = is_back_facing(ndc_coords);
+    if (backface && !program->double_sided) {
+        return 1;
+    }
+
+    for (i = 0; i < 3; i++) {
+        recip_w[i] = 1 / clip_coords[i].w;
+    }
+
+    for (i = 0; i < 3; i++) {
+        vec3_t window_coord = viewport_transform(width, height, ndc_coords[i]);
+        screen_coords[i] = vec2_new(window_coord.x, window_coord.y);
+        screen_depths[i] = window_coord.z;
+    }
+
+    bbox = find_bounding_box(screen_coords, width, height);
+    bbox_width = bbox.max_x - bbox.min_x + 1;
+    bbox_height = bbox.max_y - bbox.min_y + 1;
+    pixel_count = bbox_width * bbox_height;
+    if (pixel_count < program->batch_min_pixels) {
+        raster_shared_t shared;
+        shared.framebuffer = framebuffer;
+        shared.program = program;
+        shared.backface = backface;
+        for (i = 0; i < 3; i++) {
+            shared.screen_coords[i] = screen_coords[i];
+            shared.screen_depths[i] = screen_depths[i];
+            shared.recip_w[i] = recip_w[i];
+            shared.varyings[i] = varyings[i];
+        }
+        rasterize_tile_range(&shared, bbox.min_x, bbox.min_y,
+                             bbox.max_x, bbox.max_y,
+                             program->shader_varyings);
+        return 0;
+    }
+    tile_x0 = bbox.min_x / RASTER_TILE_SIZE;
+    tile_x1 = bbox.max_x / RASTER_TILE_SIZE;
+    tile_y0 = bbox.min_y / RASTER_TILE_SIZE;
+    tile_y1 = bbox.max_y / RASTER_TILE_SIZE;
+
+    job = tri_job_create(program, backface, screen_coords,
+                         screen_depths, recip_w, varyings);
+    darray_push(g_batch.jobs_all, job);
+
+    for (tile_y = tile_y0; tile_y <= tile_y1; tile_y++) {
+        for (tile_x = tile_x0; tile_x <= tile_x1; tile_x++) {
+            tile_index = tile_y * g_batch.tile_cols + tile_x;
+            darray_push(g_batch.tiles[tile_index].jobs, job);
         }
     }
 
@@ -554,8 +1125,14 @@ void graphics_draw_triangle(framebuffer_t *framebuffer, program_t *program) {
         varyings[1] = program->out_varyings[index1];
         varyings[2] = program->out_varyings[index2];
 
-        is_culled = rasterize_triangle(framebuffer, program,
-                                       clip_coords, varyings);
+        if (g_batch.active && g_batch.program == program &&
+            g_batch.framebuffer == framebuffer) {
+            is_culled = bin_triangle(framebuffer, program,
+                                     clip_coords, varyings);
+        } else {
+            is_culled = rasterize_triangle(framebuffer, program,
+                                           clip_coords, varyings);
+        }
         if (is_culled) {
             break;
         }

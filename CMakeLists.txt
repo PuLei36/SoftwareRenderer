@@ -20,6 +20,7 @@ set(HEADERS
     renderer/core/scene.h
     renderer/core/skeleton.h
     renderer/core/texture.h
+    renderer/core/threadpool.h
     renderer/scenes/blinn_scenes.h
     renderer/scenes/pbr_scenes.h
     renderer/scenes/scene_helper.h
@@ -43,6 +44,7 @@ set(SOURCES
     renderer/core/scene.c
     renderer/core/skeleton.c
     renderer/core/texture.c
+    renderer/core/threadpool.c
     renderer/scenes/blinn_scenes.c
     renderer/scenes/pbr_scenes.c
     renderer/scenes/scene_helper.c
@@ -96,6 +98,8 @@ if(UNIX AND NOT APPLE)
     target_compile_options(${TARGET} PRIVATE -D_POSIX_C_SOURCE=200809L)
 endif()
 
+find_package(Threads REQUIRED)
+
 # ==============================================================================
 # Link libraries
 # ==============================================================================
@@ -103,9 +107,9 @@ endif()
 if(WIN32)
     # nothing to do for now
 elseif(APPLE)
-    target_link_libraries(${TARGET} PRIVATE "-framework Cocoa")
+    target_link_libraries(${TARGET} PRIVATE "-framework Cocoa" Threads::Threads)
 else()
-    target_link_libraries(${TARGET} PRIVATE m X11)
+    target_link_libraries(${TARGET} PRIVATE m X11 Threads::Threads)
 endif()
 
 # ==============================================================================
