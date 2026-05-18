@@ -304,14 +304,7 @@ static void draw_model(model_t *model, framebuffer_t *framebuffer,
 
     uniforms = (blinn_uniforms_t*)program_get_uniforms(model->program);
     uniforms->shadow_pass = shadow_pass;
-    if (shadow_pass) {
-        program_set_batch_min_pixels(program, 0);
-    } else {
-        program_set_batch_min_pixels(program, 256);
-    }
-    if (!shadow_pass) {
-        graphics_begin_batch(framebuffer, program);
-    }
+    graphics_begin_batch(framebuffer, program);
     for (i = 0; i < num_faces; i++) {
         for (j = 0; j < 3; j++) {
             vertex_t vertex = vertices[i * 3 + j];
@@ -324,9 +317,7 @@ static void draw_model(model_t *model, framebuffer_t *framebuffer,
         }
         graphics_draw_triangle(framebuffer, program);
     }
-    if (!shadow_pass) {
-        graphics_end_batch();
-    }
+    graphics_end_batch();
 }
 
 static void release_model(model_t *model) {
