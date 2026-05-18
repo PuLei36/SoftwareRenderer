@@ -184,8 +184,19 @@ static void *threadpool_worker(void *arg) {
 }
 #endif
 
+static int g_thread_count_override = -1;
+
+void threadpool_set_thread_count(int num_threads) {
+    g_thread_count_override = num_threads;
+}
+
 int threadpool_default_threads(void) {
-    const char *env_value = getenv("RENDERER_THREADS");
+    const char *env_value;
+
+    if (g_thread_count_override >= 0) {
+        return g_thread_count_override;
+    }
+    env_value = getenv("RENDERER_THREADS");
     if (env_value != NULL && env_value[0] != '\0') {
         int requested = atoi(env_value);
         if (requested <= 0) {

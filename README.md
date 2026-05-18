@@ -112,12 +112,15 @@ make
 
 ### Launch
 
-If the software renderer is launched without arguments, one of the available
-scenes will be chosen randomly. To display a specific scene (see below),
-additional arguments should be supplied. The command line syntax is:
+If the software renderer is launched without arguments, a startup menu will
+appear for choosing the renderer and model. To skip the menu, supply arguments
+as shown below. The command line syntax is:
 
 ```
 Viewer [test_name [scene_name]]
+
+If a renderer is provided without a scene name, a random scene from that
+renderer will be chosen.
 ```
 
 ### Controls

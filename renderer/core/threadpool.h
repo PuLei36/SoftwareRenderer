@@ -5,6 +5,7 @@ typedef struct threadpool threadpool_t;
 typedef void (*threadpool_task_fn)(void *task_data, int worker_index);
 
 int threadpool_default_threads(void);
+void threadpool_set_thread_count(int num_threads);
 threadpool_t *threadpool_create(int num_threads);
 void threadpool_release(threadpool_t *pool);
 void threadpool_submit(threadpool_t *pool, threadpool_task_fn fn,

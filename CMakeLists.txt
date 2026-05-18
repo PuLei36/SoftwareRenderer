@@ -30,7 +30,11 @@ set(HEADERS
     renderer/shaders/skybox_shader.h
     renderer/tests/test_blinn.h
     renderer/tests/test_helper.h
+    renderer/tests/test_menu.h
     renderer/tests/test_pbr.h
+    renderer/tests/test_scenes.h
+    renderer/tests/test_startup.h
+    renderer/tests/pbr_layer_view.h
 )
 set(SOURCES
     renderer/core/camera.c
@@ -54,7 +58,11 @@ set(SOURCES
     renderer/shaders/skybox_shader.c
     renderer/tests/test_blinn.c
     renderer/tests/test_helper.c
+    renderer/tests/test_menu.c
     renderer/tests/test_pbr.c
+    renderer/tests/test_scenes.c
+    renderer/tests/test_startup.c
+    renderer/tests/pbr_layer_view.c
     renderer/main.c
 )
 
@@ -88,10 +96,14 @@ set_target_properties(${TARGET} PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
 
 if(MSVC)
     target_compile_options(${TARGET} PRIVATE /W4 /D_CRT_SECURE_NO_WARNINGS)
-    target_compile_options(${TARGET} PRIVATE /fp:fast)
+    target_compile_options(${TARGET} PRIVATE /fp:fast /utf-8)
 else()
     target_compile_options(${TARGET} PRIVATE -Wall -Wextra -pedantic)
     target_compile_options(${TARGET} PRIVATE -ffast-math)
+    if(WIN32)
+        target_compile_options(${TARGET} PRIVATE
+            -finput-charset=UTF-8 -fexec-charset=UTF-8)
+    endif()
 endif()
 
 if(UNIX AND NOT APPLE)
