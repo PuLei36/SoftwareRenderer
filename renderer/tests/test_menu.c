@@ -13,6 +13,9 @@
 #define MENU_TITLE_GAP 0.04f
 #define MENU_ITEM_GAP 0.015f
 
+static const vec3_t MENU_CAMERA_POSITION = {0, 0, 1.5f};
+static const vec3_t MENU_CAMERA_TARGET = {0, 0, 0};
+
 typedef enum {
     MENU_RENDERER_NONE,
     MENU_RENDERER_BLINN,
@@ -62,6 +65,8 @@ typedef struct {
     int renderer_item_count;
     menu_item_t model_items[MENU_MAX_ITEMS];
     int model_item_count;
+    menu_item_t render_back_item;
+    int reset_camera;
 } menu_context_t;
 
 static texture_t *acquire_ui_label(const char *name) {
@@ -208,6 +213,7 @@ static void enter_render_state(menu_context_t *menu, const char *scene_name) {
             menu->pbr_view_active = 1;
         }
         menu->state = MENU_RENDER;
+        menu->reset_camera = 1;
     }
 }
 
@@ -260,8 +266,73 @@ static void render_menu_screen(menu_context_t *menu, context_t *context) {
     }
 }
 
+static void leave_render_state(menu_context_t *menu) {
+    if (menu->scene) {
+        scene_release(menu->scene);
+        menu->scene = NULL;
+    }
+    if (menu->renderer == MENU_RENDERER_PBR && menu->pbr_view_active) {
+        pbr_layer_view_release_labels(&menu->pbr_view);
+        menu->pbr_view_active = 0;
+    }
+    menu->state = MENU_MODEL_SELECT;
+}
+
+static void layout_render_back_item(framebuffer_t *framebuffer,
+                                    menu_item_t *item) {
+    texture_t *label = item->label;
+    float width = (float)label->width / (float)framebuffer->width;
+    float height = (float)label->height / (float)framebuffer->height;
+    float x = 0.03f;
+    float y0 = 0.97f - height;
+    item->origin = vec2_new(x, y0);
+    item->size = vec2_new(width, height);
+}
+
+static int handle_render_back_click(menu_context_t *menu, context_t *context) {
+    menu_item_t *item = &menu->render_back_item;
+    if (!item->label) {
+        return 0;
+    }
+
+    layout_render_back_item(context->framebuffer, item);
+    if (context->single_click) {
+        if (hit_item(item, 1, context->click_pos) >= 0) {
+            leave_render_state(menu);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void draw_render_back(menu_context_t *menu, framebuffer_t *framebuffer) {
+    menu_item_t *item = &menu->render_back_item;
+    if (!item->label) {
+        return;
+    }
+    layout_render_back_item(framebuffer, item);
+    draw_item_box(framebuffer, item);
+    draw2d_draw_texture(framebuffer, item->label, item->origin);
+}
+
+static void reset_camera_if_needed(menu_context_t *menu, context_t *context) {
+    if (!menu->reset_camera) {
+        return;
+    }
+    camera_set_transform(context->camera,
+                         MENU_CAMERA_POSITION,
+                         MENU_CAMERA_TARGET);
+    menu->reset_camera = 0;
+}
+
 static void render_scene(menu_context_t *menu, context_t *context) {
-    perframe_t perframe = test_build_perframe(menu->scene, context);
+    perframe_t perframe;
+    if (handle_render_back_click(menu, context)) {
+        render_menu_screen(menu, context);
+        return;
+    }
+    reset_camera_if_needed(menu, context);
+    perframe = test_build_perframe(menu->scene, context);
     if (menu->renderer == MENU_RENDERER_PBR) {
         perframe.layer_view = pbr_layer_view_update(&menu->pbr_view, context);
     }
@@ -269,6 +340,7 @@ static void render_scene(menu_context_t *menu, context_t *context) {
     if (menu->renderer == MENU_RENDERER_PBR) {
         pbr_layer_view_draw(context->framebuffer, &menu->pbr_view);
     }
+    draw_render_back(menu, context->framebuffer);
 }
 
 static void tick_function(context_t *context, void *userdata) {
@@ -303,6 +375,8 @@ void test_menu(int argc, char *argv[]) {
     menu.label_pbr = acquire_ui_label("pbr");
     menu.label_blinn = acquire_ui_label("blinn-phong");
     menu.label_back = acquire_ui_label("back");
+    menu.render_back_item.label = menu.label_back;
+    menu.render_back_item.is_back = 1;
 
     load_scene_labels(menu.blinn_models, &menu.blinn_model_count,
                       g_blinn_creators);
