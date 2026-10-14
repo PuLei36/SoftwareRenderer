@@ -6,6 +6,24 @@
 
 /* low-level api */
 
+static int blinn_use_batch(void) {
+    static int cached = -1;
+    const char *env_value;
+
+    if (cached >= 0) {
+        return cached;
+    }
+
+    env_value = getenv("RENDERER_BLINN_BATCH");
+    if (env_value != NULL && env_value[0] != '\0') {
+        cached = atoi(env_value) != 0;
+    } else {
+        cached = 0;
+    }
+
+    return cached;
+}
+
 static mat4_t get_model_matrix(blinn_attribs_t *attribs,
                                blinn_uniforms_t *uniforms) {    /* skinning */
     if (uniforms->joint_matrices) {
@@ -300,10 +318,15 @@ static void draw_model(model_t *model, framebuffer_t *framebuffer,
     program_t *program = model->program;
     blinn_uniforms_t *uniforms;
     blinn_attribs_t *attribs;
+    int use_batch;
     int i, j;
 
     uniforms = (blinn_uniforms_t*)program_get_uniforms(model->program);
     uniforms->shadow_pass = shadow_pass;
+    use_batch = blinn_use_batch();
+    if (use_batch) {
+        graphics_begin_batch(framebuffer, program);
+    }
     for (i = 0; i < num_faces; i++) {
         for (j = 0; j < 3; j++) {
             vertex_t vertex = vertices[i * 3 + j];
@@ -315,6 +338,9 @@ static void draw_model(model_t *model, framebuffer_t *framebuffer,
             attribs->weight = vertex.weight;
         }
         graphics_draw_triangle(framebuffer, program);
+    }
+    if (use_batch) {
+        graphics_end_batch();
     }
 }
 
